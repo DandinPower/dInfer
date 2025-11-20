@@ -1004,6 +1004,7 @@ class OlmoeModel(OlmoePreTrainedModel):
             use_cache = False
 
         if inputs_embeds is None:
+            # with torch.cuda.nvtx.range("Embedding Layer"):
             inputs_embeds = self.embed_tokens(input_ids)
 
 
@@ -1020,6 +1021,7 @@ class OlmoeModel(OlmoePreTrainedModel):
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
+        # with torch.cuda.nvtx.range("Precompute RoPE"):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
@@ -1029,6 +1031,7 @@ class OlmoeModel(OlmoePreTrainedModel):
         next_decoder_cache = []
 
         for layer_idx, decoder_layer in enumerate(self.layers):
+            # with torch.cuda.nvtx.range(f"Decoding Layer"):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             layer_outputs = decoder_layer(
@@ -1056,6 +1059,7 @@ class OlmoeModel(OlmoePreTrainedModel):
             if output_router_logits and layer_outputs[-1] is not None:
                 all_router_logits += (layer_outputs[-1],)
 
+        # with torch.cuda.nvtx.range(f"Final Output Normalization"):
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer

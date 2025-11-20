@@ -428,71 +428,184 @@ class HierarchyDecoder(ParallelDecoder):
         self.threshold=threshold
         self.low_threshold=low_threshold
 
-    def get_transfer_index(self, logits,  mask_index, iter_threshold, **kwargs):
-    
-        B, L = mask_index.shape
-
-        # TODO(DuLun): support batch size > 1
-        assert B == 1
-
-        device = logits.device
-        
-        if not math.isclose(self.temperature, 0.0):
-            logits_with_noise = add_gumbel_noise(logits, temperature=self.temperature)
-        else:
-            logits_with_noise = logits
-
-        x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
-        
-        x0_logp = F.log_softmax(logits, dim=-1).gather(-1, x0.unsqueeze(-1)).squeeze(-1)
-        x0_p = x0_logp.exp()  # b, l
-
-        neg_inf_val = torch.finfo(x0_p.dtype).min
-        confidence = torch.where(mask_index, x0_p, torch.tensor(neg_inf_val, device=device, dtype=x0_p.dtype))
-        
-        prev = torch.cat(
-            [mask_index.new_zeros((B, 1), dtype=torch.bool), mask_index[:, :-1]],
-            dim=1
-        )
-        starts = torch.logical_and(mask_index, torch.logical_not(prev))
-
-        seg_id = torch.cumsum(starts.to(torch.int64), dim=-1) - 1
-        seg_id = torch.where(mask_index, seg_id, 0)
-
-        seg_max = torch.full((B, L), neg_inf_val, device=device, dtype=confidence.dtype)
-        seg_max = torch.scatter_reduce(seg_max, dim=1, index=seg_id, src=confidence, reduce='amax', include_self=True)
-
-        seg_max_at_pos = seg_max.gather(dim=1, index=seg_id)
-        transfer_index = (confidence == seg_max_at_pos)
-
-        if self.low_threshold is not None:
-            transfer_index = torch.logical_and(transfer_index, torch.gt(confidence, self.low_threshold))
-        if iter_threshold is not None:
-            transfer_index = torch.logical_or(transfer_index, torch.gt(confidence, iter_threshold))
-
-        
-        top1_idx = torch.argmax(confidence, dim=-1)
-        top1 = torch.nn.functional.one_hot(top1_idx, num_classes=L).to(torch.bool)
-        transfer_index = torch.logical_or(transfer_index, top1)
-        
-
-        return x0, transfer_index
-
     def block_init(self, block_x, block_id):
         # TODO(zhengda) we need to handle steps correctly here when the distributed version changes the gen length.
         block_mask_index = block_x == self.mask_id
         self.iter = 0
 
+    """
+    CPU Interrupt
+    """
+    # def get_transfer_index(self, logits,  mask_index, iter_threshold, **kwargs):
+    
+    #     B, L = mask_index.shape
+
+    #     # TODO(DuLun): support batch size > 1
+    #     assert B == 1
+
+    #     device = logits.device
+        
+    #     if not math.isclose(self.temperature, 0.0):
+    #         logits_with_noise = add_gumbel_noise(logits, temperature=self.temperature)
+    #     else:
+    #         logits_with_noise = logits
+
+    #     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
+        
+    #     x0_logp = F.log_softmax(logits, dim=-1).gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+    #     x0_p = x0_logp.exp()  # b, l
+
+    #     neg_inf_val = torch.finfo(x0_p.dtype).min
+    #     confidence = torch.where(mask_index, x0_p, torch.tensor(neg_inf_val, device=device, dtype=x0_p.dtype))
+        
+    #     prev = torch.cat(
+    #         [mask_index.new_zeros((B, 1), dtype=torch.bool), mask_index[:, :-1]],
+    #         dim=1
+    #     )
+    #     starts = torch.logical_and(mask_index, torch.logical_not(prev))
+
+    #     seg_id = torch.cumsum(starts.to(torch.int64), dim=-1) - 1
+    #     seg_id = torch.where(mask_index, seg_id, 0)
+
+    #     seg_max = torch.full((B, L), neg_inf_val, device=device, dtype=confidence.dtype)
+    #     seg_max = torch.scatter_reduce(seg_max, dim=1, index=seg_id, src=confidence, reduce='amax', include_self=True)
+
+    #     seg_max_at_pos = seg_max.gather(dim=1, index=seg_id)
+    #     transfer_index = (confidence == seg_max_at_pos)
+
+    #     if self.low_threshold is not None:
+    #         transfer_index = torch.logical_and(transfer_index, torch.gt(confidence, self.low_threshold))
+    #     if iter_threshold is not None:
+    #         transfer_index = torch.logical_or(transfer_index, torch.gt(confidence, iter_threshold))
+
+        
+    #     top1_idx = torch.argmax(confidence, dim=-1)
+    #     top1 = torch.nn.functional.one_hot(top1_idx, num_classes=L).to(torch.bool)
+    #     transfer_index = torch.logical_or(transfer_index, top1)
+        
+
+    #     return x0, transfer_index
+    
+    # def decode(self, logits, block_start, block_end, x, iter_threshold = None):
+    #     """ Decode the logits in a block.
+    #     """
+    #     if iter_threshold is None:
+    #         iter_threshold = self.threshold
+    #     mask_index = (x[:, block_start:block_end] == self.mask_id)
+    #     assert mask_index.shape[1] == logits.shape[1]
+
+    #     curr_x = x[:, block_start:block_end]
+    #     with torch.cuda.nvtx.range("Get Transfer Index"):
+    #         x0, transfer_index = self.get_transfer_index(logits, mask_index, iter_threshold)
+    #     self.iter += 1
+    #     transfer_index = torch.logical_and(transfer_index, mask_index)
+    #     x[:, block_start:block_end][transfer_index] = x0[transfer_index]
+
+    """
+    GPU only
+    """
+    def get_transfer_index(self, logits, mask_index, iter_threshold, **kwargs):
+        B, L = mask_index.shape
+        
+        # Keep assertions; they are cheap on CPU
+        assert B == 1 
+
+        # 1. Calculate Noise
+        if not math.isclose(self.temperature, 0.0):
+            # Ensure add_gumbel_noise generates noise directly on device
+            logits_with_noise = add_gumbel_noise(logits, temperature=self.temperature)
+        else:
+            logits_with_noise = logits
+
+        x0 = torch.argmax(logits_with_noise, dim=-1) 
+        
+        x0_logp = F.log_softmax(logits, dim=-1).gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+        x0_p = x0_logp.exp()
+
+        # 2. FIX: Use masked_fill instead of where + torch.tensor
+        # masked_fill takes a python scalar and embeds it in the kernel instruction
+        neg_inf_val = torch.finfo(x0_p.dtype).min
+        
+        # Initialize confidence with x0_p
+        confidence = x0_p.clone()
+        # In-place fill where the mask is False (assuming mask_index is BoolTensor where True=Keep)
+        # Note: Check your mask logic. Usually mask=1 means keep, mask=0 means pad. 
+        # Your original code: where(mask, x0_p, -inf). 
+        # So if mask is False, we fill with -inf.
+        confidence.masked_fill_(~mask_index, neg_inf_val)
+        
+        # 3. Segment Logic
+        prev = torch.cat(
+            [mask_index.new_zeros((B, 1), dtype=torch.bool), mask_index[:, :-1]],
+            dim=1
+        )
+        starts = torch.logical_and(mask_index, torch.logical_not(prev))
+        seg_id = torch.cumsum(starts.to(torch.int64), dim=-1) - 1
+        
+        # Optimization: Use masked_fill here too instead of where
+        seg_id.masked_fill_(~mask_index, 0)
+
+        # 4. FIX: Use full_like or direct fill to avoid HtoD copy ambiguity
+        # Although torch.full is usually optimized, this makes it explicit
+        seg_max = torch.empty_like(confidence).fill_(neg_inf_val)
+        
+        seg_max = torch.scatter_reduce(
+            seg_max, 
+            dim=1, 
+            index=seg_id, 
+            src=confidence, 
+            reduce='amax', 
+            include_self=True
+        )
+
+        seg_max_at_pos = seg_max.gather(dim=1, index=seg_id)
+        transfer_index = (confidence == seg_max_at_pos)
+
+        # 5. Thresholds logic (Pure GPU)
+        if self.low_threshold is not None:
+            transfer_index.logical_and_(confidence > self.low_threshold)
+        if iter_threshold is not None:
+            transfer_index.logical_or_(confidence > iter_threshold)
+
+        # 6. Top1 Logic
+        top1_idx = torch.argmax(confidence, dim=-1) # Returns [B]
+        
+        # One_hot creates a new tensor, but stays on device.
+        top1 = F.one_hot(top1_idx, num_classes=L).to(torch.bool)
+        
+        transfer_index.logical_or_(top1)
+
+        return x0, transfer_index
+
+
     def decode(self, logits, block_start, block_end, x, iter_threshold = None):
-        """ Decode the logits in a block.
-        """
+        """ Decode the logits in a block. """
         if iter_threshold is None:
             iter_threshold = self.threshold
-        mask_index = (x[:, block_start:block_end] == self.mask_id)
+            
+        # View of the current block
+        curr_x = x[:, block_start:block_end]
+        
+        mask_index = (curr_x == self.mask_id)
+        
+        # Assertion is fine (shapes are CPU metadata)
         assert mask_index.shape[1] == logits.shape[1]
 
-        curr_x = x[:, block_start:block_end]
-        x0, transfer_index = self.get_transfer_index(logits, mask_index, iter_threshold)
+        with torch.cuda.nvtx.range("Get Transfer Index"):
+            x0, transfer_index = self.get_transfer_index(logits, mask_index, iter_threshold)
+        
         self.iter += 1
-        transfer_index = torch.logical_and(transfer_index, mask_index)
-        x[:, block_start:block_end][transfer_index] = x0[transfer_index]
+        
+        # In-place logical_and to save memory/allocation
+        transfer_index.logical_and_(mask_index)
+
+        # --- THE FIX ---
+        # Instead of: x[...][mask] = x0[mask]
+        # Use torch.where. It takes (Condition, ValueIfTrue, ValueIfFalse)
+        # This generates a tensor of shape (B, L) strictly on GPU. 
+        # No size calculation needed by CPU.
+        
+        updated_block = torch.where(transfer_index, x0, curr_x)
+        
+        # Write back to x (GPU-to-GPU copy, no sync)
+        x[:, block_start:block_end] = updated_block

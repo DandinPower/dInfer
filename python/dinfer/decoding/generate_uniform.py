@@ -96,9 +96,10 @@ class BlockRunner:
         batch_size = x.batch_size
         while (block == decoder.mask_id).sum() > 0:
             unroll_k = int(max(min((block == decoder.mask_id).sum()//self.expected_tpf, self.maximum_unroll), 1))
-            for unroll_i in range(unroll_k):
-                self.diff_iteration.forward(model, decoder, x, kv_cache, block, block_loc, block_id)
-
+            with torch.cuda.nvtx.range(f"Forward (unroll)"):
+                for unroll_i in range(unroll_k):
+                    with torch.cuda.nvtx.range(f"Forward"):
+                        self.diff_iteration.forward(model, decoder, x, kv_cache, block, block_loc, block_id)
             # If there are more than one sequence, we should filter the sequences and only decode
             # on the sequences that still have masked tokens.
             if batch_size > 1:
@@ -593,11 +594,12 @@ class IterSmoothDiffusionLLM(BlockWiseDiffusionLLM):
         self.diff_iteration.reset_input_embeds(x)
         kv_cache = self.cache_factory.create() if self.cache_factory is not None else None
         for block_id, (block_loc, block) in enumerate(it):
-            self.decoder.block_init(block, block_id)
-            decode_compl = self.block_decoder.decode(self.model, self.decoder, x, kv_cache, block, block_loc, block_id)
-            # If all sequences have EOS, we have finished decoding.
-            if torch.all(decode_compl):
-                break
+            with torch.cuda.nvtx.range(f"Block decoding: {block_id}"):
+                self.decoder.block_init(block, block_id)
+                decode_compl = self.block_decoder.decode(self.model, self.decoder, x, kv_cache, block, block_loc, block_id)
+                # If all sequences have EOS, we have finished decoding.
+                if torch.all(decode_compl):
+                    break
         logger.info(f'The number of diffusion iterations: {self.num_forwards}')
         return x.get_generated_tokens()
 
@@ -713,9 +715,12 @@ class IterSmoothWithVicinityCache(DiffusionIteration):
             return
 
         if kv_cache.past_key_values is None or (kv_cache.require_update(self.iter_no, block_start, block_end) and block_id > 0):
-            out_full = model(inputs_embeds=self.inputs_embeds, use_cache=True)
+            with torch.cuda.nvtx.range("Real Model Forward (Full)"):
+                out_full = model(inputs_embeds=self.inputs_embeds, use_cache=True)
+            
             self.num_forwards += 1
-            decoder.decode(out_full.logits[:, block_start:block_end], block_start, block_end, x, iter_threshold)
+            with torch.cuda.nvtx.range("Run Decoding Logic"):
+                decoder.decode(out_full.logits[:, block_start:block_end], block_start, block_end, x, iter_threshold)
             mask_index = (x.data == decoder.mask_id)
             self.inputs_embeds = self.h2e(x.data, mask_index, out_full.logits, iter_cont_weight)
             kv_cache.update(out_full.past_key_values)
@@ -725,20 +730,22 @@ class IterSmoothWithVicinityCache(DiffusionIteration):
         iter_cont_weight = min(self.cont_weight_init+self.cont_weight_growth*self.iter_no, self.cont_weight)
         iter_threshold = max(1-self.iter_no*self.threshold_decay, decoder.threshold)
         past_key_values, replace_position = kv_cache.get_key_values(left_start, right_end)
-        out_step = model(
-                inputs_embeds=self.inputs_embeds[:, left_start:right_end],
-                past_key_values=past_key_values,
-                use_cache=True,
-                replace_position=replace_position
-        )
+        with torch.cuda.nvtx.range("Real Model Forward (with kv)"):
+            out_step = model(
+                    inputs_embeds=self.inputs_embeds[:, left_start:right_end],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    replace_position=replace_position
+            )
 
         self.num_forwards += 1
         self.iter_no += 1
         offset = block_start - left_start
         logits_block = out_step.logits[:, offset:offset + (block_end - block_start)]
-        decoder.decode(logits_block, block_start, block_end, x, iter_threshold)
-        mask_index = (x.data[:, left_start:right_end] == decoder.mask_id)
-        self.inputs_embeds[:, left_start:right_end] = self.h2e(x.data[:, left_start:right_end], mask_index, out_step.logits, iter_cont_weight)
+        with torch.cuda.nvtx.range("Run Decoding Logic"):
+            decoder.decode(logits_block, block_start, block_end, x, iter_threshold)
+            mask_index = (x.data[:, left_start:right_end] == decoder.mask_id)
+            self.inputs_embeds[:, left_start:right_end] = self.h2e(x.data[:, left_start:right_end], mask_index, out_step.logits, iter_cont_weight)
 
 class IterSmoothWithVicinityCacheDiffusionLLM(IterSmoothDiffusionLLM):
     """ This diffusion LLM inference generates tokens with vicinity cache and iteration smoothing.
